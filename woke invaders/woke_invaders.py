@@ -35,7 +35,69 @@ font_tiny = pygame.font.SysFont("Courier", 14)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SPRITE_DIR = os.path.join(SCRIPT_DIR, "sprites")
+MUSIC_DIR = os.path.join(SCRIPT_DIR, "music")
 HIGHSCORE_FILE = os.path.join(SCRIPT_DIR, "highscores.json")
+
+class MusicPlayer:
+    """Drop .mp3 / .ogg / .wav files into a 'music' folder next to the script."""
+    def __init__(self):
+        self.tracks = []
+        self.index = 0
+        self.enabled = True
+        self.volume = 0.45
+        self._scan()
+        if self.tracks:
+            try:
+                pygame.mixer.music.set_volume(self.volume)
+                self.play_current()
+            except Exception:
+                self.enabled = False
+
+    def _scan(self):
+        self.tracks = []
+        if not os.path.isdir(MUSIC_DIR):
+            try:
+                os.makedirs(MUSIC_DIR, exist_ok=True)
+            except Exception:
+                pass
+            return
+        for name in sorted(os.listdir(MUSIC_DIR)):
+            if name.lower().endswith((".mp3", ".ogg", ".wav", ".flac")):
+                self.tracks.append(os.path.join(MUSIC_DIR, name))
+
+    def play_current(self):
+        if not self.tracks or not self.enabled:
+            return
+        try:
+            pygame.mixer.music.load(self.tracks[self.index])
+            pygame.mixer.music.play(-1)
+        except Exception as e:
+            print("Music load error:", e)
+
+    def next_track(self):
+        if len(self.tracks) < 2:
+            return
+        self.index = (self.index + 1) % len(self.tracks)
+        self.play_current()
+
+    def toggle(self):
+        self.enabled = not self.enabled
+        try:
+            if self.enabled:
+                self.play_current()
+            else:
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+    def set_volume(self, v):
+        self.volume = max(0.0, min(1.0, v))
+        try:
+            pygame.mixer.music.set_volume(self.volume)
+        except Exception:
+            pass
+
+music_player = MusicPlayer()
 
 DIFFICULTIES = {
     "EASY":   {"lives": 5, "enemy_speed": 0.75, "shoot_mult": 1.35, "drop_rate": 0.28, "rows": 4, "cols": 8},
@@ -150,11 +212,12 @@ EXPLOSION_2 = [[None,ORANGE,None,ORANGE,None],[ORANGE,None,YELLOW,None,ORANGE],[
 explosion_surfs = [make_surface_from_pixels(EXPLOSION_1), make_surface_from_pixels(EXPLOSION_2)]
 
 POWERUP_TYPES = {
-    "life":   {"color": GREEN, "label": "+LIFE", "duration": 0},
-    "rapid":  {"color": CYAN, "label": "RAPID", "duration": 480},
-    "spread": {"color": YELLOW, "label": "SPREAD", "duration": 480},
-    "shield": {"color": (80,160,255), "label": "SHIELD", "duration": 300},
-    "slow":   {"color": PURPLE, "label": "SLOW", "duration": 360},
+    "life":    {"color": GREEN, "label": "+LIFE", "duration": 0},
+    "rapid":   {"color": CYAN, "label": "RAPID", "duration": 480},
+    "spread":  {"color": YELLOW, "label": "SPREAD", "duration": 480},
+    "shield":  {"color": (80,160,255), "label": "SHIELD", "duration": 300},
+    "slow":    {"color": PURPLE, "label": "SLOW", "duration": 360},
+    "wingman": {"color": (200, 200, 255), "label": "WING", "duration": 0},
 }
 
 class Player:
@@ -185,13 +248,32 @@ class Player:
         self.bullet_time = 100.0 # energy 0-100
         self.bullet_time_active = 0
         self.holding_fire = False
+        self.wingmen = 0         # sacrificial clones that absorb hits
+        # Movement & core systems
+        self.dash_cooldown = 0
+        self.dash_active = 0
+        self.dash_dir = 0
+        self.tractor_active = False
+        self.overdrive_meter = 0.0
+        self.overdrive_active = 0
+        self.decoy_timer = 0
+        self.decoy_rect = None
 
     def update(self, keys, time_scale=1.0):
-        # Movement with wrap
-        dx = 0
-        if keys[pygame.K_LEFT] or keys[pygame.K_a]: dx -= self.speed
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d]: dx += self.speed
-        self.rect.x += int(dx * time_scale)
+        # Dash movement overrides normal if active
+        if self.dash_active > 0:
+            self.rect.x += int(self.dash_dir * 14 * time_scale)
+            self.dash_active = max(0, self.dash_active - time_scale)
+            self.invincible = max(self.invincible, 8)
+        else:
+            dx = 0
+            if keys[pygame.K_LEFT] or keys[pygame.K_a]: dx -= self.speed
+            if keys[pygame.K_RIGHT] or keys[pygame.K_d]: dx += self.speed
+            # Overdrive speed boost
+            if self.overdrive_active > 0:
+                dx *= 1.6
+            self.rect.x += int(dx * time_scale)
+
         # Screen-edge warp (Pac-Man style)
         if self.rect.right < 0:
             self.rect.left = SCREEN_WIDTH
@@ -200,6 +282,12 @@ class Player:
 
         if self.cooldown > 0: self.cooldown = max(0, self.cooldown - time_scale)
         if self.invincible > 0: self.invincible = max(0, self.invincible - time_scale)
+        if self.dash_cooldown > 0: self.dash_cooldown = max(0, self.dash_cooldown - time_scale)
+        if self.overdrive_active > 0: self.overdrive_active = max(0, self.overdrive_active - time_scale)
+        if self.decoy_timer > 0:
+            self.decoy_timer = max(0, self.decoy_timer - time_scale)
+            if self.decoy_timer <= 0:
+                self.decoy_rect = None
         if self.ability_cooldown > 0: self.ability_cooldown = max(0, self.ability_cooldown - time_scale)
         if self.parry_cooldown > 0: self.parry_cooldown = max(0, self.parry_cooldown - time_scale)
         if self.parry_active > 0: self.parry_active = max(0, self.parry_active - time_scale)
@@ -273,6 +361,40 @@ class Player:
             return True
         return False
 
+    def try_dash(self, keys):
+        if self.dash_cooldown > 0 or self.dash_active > 0:
+            return False
+        direction = 0
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            direction = -1
+        elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            direction = 1
+        else:
+            direction = -1 if self.rect.centerx > SCREEN_WIDTH // 2 else 1
+        self.dash_dir = direction
+        self.dash_active = 10
+        self.dash_cooldown = 75
+        self.invincible = max(self.invincible, 12)
+        play(snd_select)
+        return True
+
+    def try_overdrive(self):
+        if self.overdrive_meter >= 80 and self.overdrive_active <= 0:
+            self.overdrive_active = 210  # ~3.5s
+            self.overdrive_meter = 0
+            self.invincible = max(self.invincible, 30)
+            play(snd_power)
+            return True
+        return False
+
+    def try_decoy(self):
+        if self.decoy_timer <= 0:
+            self.decoy_timer = 150
+            self.decoy_rect = self.rect.copy()
+            play(snd_select)
+            return True
+        return False
+
     def apply_powerup(self, ptype, game):
         play(snd_power)
         if ptype == "life":
@@ -285,21 +407,26 @@ class Player:
             self.invincible = max(self.invincible, 300); self.powerup_timers["shield"] = 300; game.message = "SHIELD!"
         elif ptype == "slow":
             game.enemy_speed_modifier = 0.35; self.powerup_timers["slow"] = 360; game.message = "SLOW FIELD!"
+        elif ptype == "wingman":
+            self.wingmen = min(self.wingmen + 1, 3)
+            game.message = f"WINGMAN +1 ({self.wingmen})"
         game.message_timer = 55
 
     def shoot(self):
-        if self.overheating and self.heat > 70:
-            return []  # can't shoot while overheating hard
-        rate = 5 if self.rapid_fire else 12
-        # Note: fire_rate_bonus is applied from Game when needed; keep base here
+        if self.overheating and self.heat > 70 and self.overdrive_active <= 0:
+            return []
+        rate = 4 if (self.rapid_fire or self.overdrive_active > 0) else 12
         if self.cooldown <= 0:
             self.cooldown = rate
             play(snd_shoot)
-            if self.triple_shot:
-                return [Bullet(self.rect.centerx-16, self.rect.top, -12, True, self.bullet_surf),
-                        Bullet(self.rect.centerx, self.rect.top, -12, True, self.bullet_surf),
-                        Bullet(self.rect.centerx+16, self.rect.top, -12, True, self.bullet_surf)]
-            return [Bullet(self.rect.centerx, self.rect.top, -12, True, self.bullet_surf)]
+            piercing = self.overdrive_active > 0
+            if self.triple_shot or self.overdrive_active > 0:
+                return [
+                    Bullet(self.rect.centerx-18, self.rect.top, -13, True, self.bullet_surf, piercing=piercing),
+                    Bullet(self.rect.centerx, self.rect.top, -14, True, self.bullet_surf, piercing=piercing),
+                    Bullet(self.rect.centerx+18, self.rect.top, -13, True, self.bullet_surf, piercing=piercing)
+                ]
+            return [Bullet(self.rect.centerx, self.rect.top, -12, True, self.bullet_surf, piercing=piercing)]
         return []
 
     def vent_emp(self, game):
@@ -322,8 +449,20 @@ class Player:
         return True
 
     def draw(self, surface):
-        if self.invincible <= 0 or (int(self.invincible) // 3) % 2 == 0:
+        # Decoy hologram
+        if self.decoy_rect and self.decoy_timer > 0:
+            ghost = self.image.copy()
+            ghost.set_alpha(90)
+            surface.blit(ghost, self.decoy_rect)
+            pygame.draw.rect(surface, (100, 200, 255), self.decoy_rect.inflate(4, 4), 1)
+        if self.invincible <= 0 or (int(self.invincible) // 3) % 2 == 0 or self.dash_active > 0:
             surface.blit(self.image, self.rect)
+            # Wingmen visual
+            for i in range(self.wingmen):
+                wx = self.rect.left - 14 - i * 12
+                wy = self.rect.centery
+                pygame.draw.polygon(surface, (200, 200, 255),
+                    [(wx, wy-6), (wx+5, wy), (wx, wy+6), (wx-5, wy)])
             if self.powerup_timers["shield"] > 0 or self.parry_active > 0:
                 col = CYAN if self.parry_active > 0 else (80,160,255)
                 pygame.draw.circle(surface, col, self.rect.center,
@@ -331,14 +470,25 @@ class Player:
             if self.bullet_time_active > 0:
                 pygame.draw.circle(surface, (180, 220, 255), self.rect.center,
                                    max(self.rect.w, self.rect.h)//2 + 16, 1)
+            if self.overdrive_active > 0:
+                pygame.draw.circle(surface, ORANGE, self.rect.center,
+                                   max(self.rect.w, self.rect.h)//2 + 14, 2)
+            if self.dash_active > 0:
+                pygame.draw.circle(surface, WHITE, self.rect.center,
+                                   max(self.rect.w, self.rect.h)//2 + 6, 1)
+            # Tractor beam visual
+            if self.tractor_active:
+                pygame.draw.circle(surface, (100, 180, 255), self.rect.center, 90, 1)
 
 class Bullet:
-    def __init__(self, x, y, speed, is_player=True, image=None, reflected=False):
+    def __init__(self, x, y, speed, is_player=True, image=None, reflected=False, piercing=False):
         self.is_player = is_player
         self.image = image if image else player_bullet_surfs[0]
         self.rect = self.image.get_rect(center=(x, y))
         self.speed = speed
         self.reflected = reflected
+        self.piercing = piercing
+        self.hit_set = set()  # for piercing tracking
     def update(self, time_scale=1.0):
         self.rect.y += self.speed * time_scale
         return -20 <= self.rect.y <= SCREEN_HEIGHT + 20
@@ -436,6 +586,30 @@ class Debris:
         pygame.draw.rect(surface, self.color, self.rect, border_radius=3)
         pygame.draw.rect(surface, GRAY, self.rect, 1, border_radius=3)
 
+class EMPCloud:
+    """Mid-field zone that slows projectiles passing through."""
+    def __init__(self):
+        w = random.randint(80, 140)
+        h = random.randint(50, 90)
+        self.rect = pygame.Rect(
+            random.randint(40, SCREEN_WIDTH - w - 40),
+            random.randint(160, 320),
+            w, h
+        )
+        self.life = random.randint(400, 700)
+        self.vx = random.choice([-0.6, -0.3, 0.3, 0.6])
+    def update(self, time_scale=1.0):
+        self.rect.x += self.vx * time_scale
+        if self.rect.left < 20 or self.rect.right > SCREEN_WIDTH - 20:
+            self.vx *= -1
+        self.life -= time_scale
+        return self.life > 0
+    def draw(self, surface):
+        s = pygame.Surface((self.rect.w, self.rect.h), pygame.SRCALPHA)
+        s.fill((80, 160, 255, 45))
+        surface.blit(s, self.rect.topleft)
+        pygame.draw.rect(surface, (100, 180, 255), self.rect, 1)
+
 # Wave Mutators (risk / reward cards between levels)
 MUTATORS = [
     {"id": "haste", "name": "HASTE", "desc": "Enemies +25% speed, Score x1.5", "apply": "haste"},
@@ -462,6 +636,7 @@ class Game:
         self.powerups = []
         self.float_texts = []
         self.debris = []
+        self.emp_clouds = []
         self.score = 0
         self.level = 1
         self.enemy_direction = 1
@@ -485,6 +660,9 @@ class Game:
         self.double_damage = False
         self.vampire = False
         self.chaos_mode = False
+        # Escalation (call next wave early)
+        self.escalation = 0
+        self.escalation_mult = 1.0
 
     def start_game(self):
         self.player = Player(self.selected_char, self.difficulty)
@@ -496,6 +674,7 @@ class Game:
         self.powerups = []
         self.float_texts = []
         self.debris = [Debris() for _ in range(3)]
+        self.emp_clouds = [EMPCloud() for _ in range(2)]
         self.formation_name = "PHALANX"
         self.active_mutators = []
         self.score_mult = 1.0
@@ -505,6 +684,8 @@ class Game:
         self.double_damage = False
         self.vampire = False
         self.chaos_mode = False
+        self.escalation = 0
+        self.escalation_mult = 1.0
         self.spawn_enemies()
         self.state = "playing"
         self.enemy_direction = 1
@@ -513,6 +694,26 @@ class Game:
         self.time_scale = 1.0
         self.message = f"LEVEL 1 - {self.formation_name}"
         self.message_timer = 70
+
+    def call_next_wave_early(self):
+        """Risk/reward: spawn another wave while current one is still alive."""
+        if self.state != "playing":
+            return
+        alive = sum(1 for e in self.enemies if e.alive)
+        if alive < 3:
+            return  # not worth it / too empty
+        self.escalation += 1
+        self.escalation_mult = 1.0 + self.escalation * 0.35
+        self.score_mult *= 1.15
+        # Spawn additional enemies on top of existing ones
+        old = self.enemies[:]
+        self.level += 1
+        self.spawn_enemies()
+        # Keep the old ones too
+        self.enemies = old + self.enemies
+        self.message = f"ESCALATION x{self.escalation}!  Mult x{self.escalation_mult:.1f}"
+        self.message_timer = 70
+        play(snd_power)
 
     def apply_mutator(self, mut):
         self.active_mutators.append(mut["name"])
@@ -560,14 +761,18 @@ class Game:
         enemies = []
         bounty_chance = 0.12 if self.bounty_bonus else 0.05
 
-        def add(x, y, etype=None, splitter=False, bounty=False, boss=False):
+        def add(x, y, etype=None, splitter=False, bounty=False, boss=False, shield=False):
             if etype is None:
                 rowish = max(0, (y - 40) // spacing_y)
                 etype = 0 if rowish < 1 else (1 if rowish < 3 else 2)
             if self.chaos_mode and not boss:
                 etype = random.randint(0, 2)
             is_bounty = bounty or (random.random() < bounty_chance and not boss)
-            enemies.append(Enemy(int(x), int(y), etype, is_splitter=splitter, is_bounty=is_bounty, is_boss=boss))
+            e = Enemy(int(x), int(y), etype, is_splitter=splitter, is_bounty=is_bounty, is_boss=boss)
+            if shield and not boss:
+                e.hp += 1  # Shield-bearer front row
+                e.points = int(e.points * 1.4)
+            enemies.append(e)
 
         if form_id == 0:
             self.formation_name = "PHALANX"
@@ -575,7 +780,9 @@ class Game:
             start_x = (SCREEN_WIDTH - cols * spacing_x) // 2
             for r in range(rows):
                 for c in range(cols):
-                    add(start_x + c * spacing_x, 45 + r * spacing_y, splitter=(r==0 and c%4==0 and self.level>2))
+                    add(start_x + c * spacing_x, 45 + r * spacing_y,
+                        splitter=(r==0 and c%4==0 and self.level>2),
+                        shield=(r == 0))  # front row shield-bearers
         elif form_id == 1:
             self.formation_name = "SPEARHEAD"
             rows = base_rows + 1
@@ -683,14 +890,16 @@ class Game:
                     diver = random.choice(candidates)
                     diver.diving = True
                     diver.dive_speed = 3.5 + random.random() * 2
+            # Only non-diving formation enemies reaching the bottom = classic game over
             for e in self.enemies:
-                if e.alive and e.rect.bottom >= self.player.rect.top - 4:
-                    self.player.lives = 0; self.state = "gameover"; return
-        # Update divers independently
+                if e.alive and not e.diving and e.rect.bottom >= self.player.rect.top - 4:
+                    self.player.lives = 0
+                    self.state = "gameover"
+                    return
+        # Update divers independently (they deal normal damage on touch, not instant kill)
         for e in self.enemies:
             if e.alive and e.diving:
                 e.rect.y += e.dive_speed * time_scale
-                # slight tracking toward player
                 if e.rect.centerx < self.player.rect.centerx:
                     e.rect.x += 1.2 * time_scale
                 else:
@@ -705,7 +914,11 @@ class Game:
             alive = [e for e in self.enemies if e.alive]
             if alive:
                 s = random.choice(alive)
-                self.enemy_bullets.append(Bullet(s.rect.centerx, s.rect.bottom, 5, False, enemy_bullet_surf))
+                # Decoy draws some fire
+                target_x = s.rect.centerx
+                if self.player.decoy_rect and random.random() < 0.55:
+                    target_x = self.player.decoy_rect.centerx
+                self.enemy_bullets.append(Bullet(target_x, s.rect.bottom, 5, False, enemy_bullet_surf))
         if self.player and self.player.powerup_timers.get("slow", 0) <= 0:
             if self.enemy_speed_modifier < 1.0:
                 self.enemy_speed_modifier = min(1.0, self.enemy_speed_modifier + 0.003)
@@ -718,6 +931,7 @@ class Game:
 
         if self.shake > 0: self.shake = max(0, self.shake - 1)
         self.player.holding_fire = keys[pygame.K_SPACE] or keys[pygame.K_UP] or keys[pygame.K_w]
+        self.player.tractor_active = keys[pygame.K_x]
         self.player.update(keys, ts)
 
         if (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or keys[pygame.K_q]) and self.player.can_use_ability():
@@ -728,21 +942,56 @@ class Game:
         # Bullet time
         if keys[pygame.K_r]:
             self.player.try_bullet_time()
-        # EMP vent (release fire when hot, or press V)
+        # EMP vent
         if keys[pygame.K_v] or (not self.player.holding_fire and self.player.heat > 75 and self.player.overheating):
             self.player.vent_emp(self)
+        # Phase Dash
+        if keys[pygame.K_c] or keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]:
+            self.player.try_dash(keys)
+        # Overdrive
+        if keys[pygame.K_z] or keys[pygame.K_TAB]:
+            if self.player.try_overdrive():
+                self.message = "OVERDRIVE!"
+                self.message_timer = 50
+        # Decoy
+        if keys[pygame.K_g] or keys[pygame.K_b]:
+            self.player.try_decoy()
+        # Call next wave early (escalation)
+        if keys[pygame.K_n]:
+            # simple debounce via message timer
+            if self.message_timer <= 0:
+                self.call_next_wave_early()
 
         if self.player.holding_fire:
             self.bullets.extend(self.player.shoot())
 
+        # Tractor beam pulls power-ups
+        if self.player.tractor_active:
+            for p in self.powerups:
+                dx = self.player.rect.centerx - p.rect.centerx
+                dy = self.player.rect.centery - p.rect.centery
+                dist = math.hypot(dx, dy) or 1
+                if dist < 220:
+                    p.rect.x += int(dx / dist * 4.5)
+                    p.rect.y += int(dy / dist * 4.5)
+
+        # EMP clouds slow projectiles inside them
+        for cloud in self.emp_clouds:
+            for b in self.bullets + self.enemy_bullets:
+                if cloud.rect.colliderect(b.rect):
+                    b.rect.y -= b.speed * ts * 0.55  # counteract part of movement = slower
+
         self.bullets = [b for b in self.bullets if b.update(ts)]
         self.enemy_bullets = [b for b in self.enemy_bullets if b.update(ts)]
 
-        # Player bullets vs enemies + splitters
+        # Player bullets vs enemies + splitters + piercing
         for b in self.bullets[:]:
+            hit_something = False
             for e in self.enemies:
-                if e.alive and b.rect.colliderect(e.rect):
+                if e.alive and b.rect.colliderect(e.rect) and id(e) not in b.hit_set:
                     e.hp -= 1
+                    b.hit_set.add(id(e))
+                    hit_something = True
                     if e.hp <= 0:
                         e.alive = False
                         if e.is_splitter:
@@ -751,7 +1000,6 @@ class Game:
                             self.float_texts.append(FloatingText(e.rect.centerx, e.rect.centery, "SPLIT!", ORANGE))
                         if e.is_bounty:
                             self.float_texts.append(FloatingText(e.rect.centerx, e.rect.centery - 20, "BOUNTY!", GOLD))
-                            # Stage buff: small permanent-ish bonuses
                             self.player.base_speed = min(9, self.player.base_speed + 0.3)
                             self.player.bullet_time = min(100, self.player.bullet_time + 20)
                             self.message = "BOUNTY CLAIMED!"
@@ -764,20 +1012,25 @@ class Game:
                         mult = 1 + min(self.player.combo // 4, 5)
                         pts = int(e.points * mult * self.score_mult)
                         self.score += pts
+                        self.player.overdrive_meter = min(100, self.player.overdrive_meter + 4 + (8 if e.is_boss else 0))
                         self.explosions.append(Explosion(e.rect.centerx, e.rect.centery))
                         self.float_texts.append(FloatingText(e.rect.centerx, e.rect.centery-8, f"+{pts}", ORANGE if mult > 1 else YELLOW))
                         self.spawn_powerup(e.rect.centerx, e.rect.centery)
                         if self.vampire:
                             self.player.bullet_time = min(100, self.player.bullet_time + 4)
                         play(snd_hit)
-                    if b in self.bullets: self.bullets.remove(b)
-                    break
-            # Debris can block player shots
-            for d in self.debris:
-                if d.hp > 0 and b.rect.colliderect(d.rect):
-                    d.hp -= 1
-                    if b in self.bullets: self.bullets.remove(b)
-                    break
+                    if not b.piercing:
+                        if b in self.bullets: self.bullets.remove(b)
+                        break
+            if not b.piercing and hit_something:
+                continue
+            # Debris can block non-piercing shots
+            if not b.piercing:
+                for d in self.debris:
+                    if d.hp > 0 and b.rect.colliderect(d.rect):
+                        d.hp -= 1
+                        if b in self.bullets: self.bullets.remove(b)
+                        break
 
         # Enemy bullets vs player + parry reflect
         for b in self.enemy_bullets[:]:
@@ -790,20 +1043,59 @@ class Game:
                 play(snd_parry)
                 continue
             if self.player.invincible <= 0 and b.rect.colliderect(self.player.rect):
-                dmg = 2 if self.double_damage else 1
-                self.player.lives -= dmg
-                self.player.invincible = 80
-                self.player.combo = 0
-                self.shake = 12
-                self.explosions.append(Explosion(self.player.rect.centerx, self.player.rect.centery))
-                play(snd_hurt)
                 if b in self.enemy_bullets: self.enemy_bullets.remove(b)
-                if self.player.lives <= 0:
-                    self.state = "gameover"
-                    if self.score > self.highscores.get(self.difficulty, 0):
-                        self.highscores[self.difficulty] = self.score
-                        save_highscores(self.highscores)
+                if self.player.wingmen > 0:
+                    # Sacrificial wingman absorbs the hit + mini explosion
+                    self.player.wingmen -= 1
+                    self.player.invincible = 60
+                    self.shake = 8
+                    self.explosions.append(Explosion(self.player.rect.centerx, self.player.rect.centery))
+                    self.float_texts.append(FloatingText(self.player.rect.centerx, self.player.rect.top - 15, "WINGMAN!", (200,200,255)))
+                    # Small EMP clear around player
+                    for eb in self.enemy_bullets[:]:
+                        if math.hypot(eb.rect.centerx - self.player.rect.centerx, eb.rect.centery - self.player.rect.centery) < 100:
+                            self.enemy_bullets.remove(eb)
+                    play(snd_power)
+                else:
+                    dmg = 2 if self.double_damage else 1
+                    self.player.lives -= dmg
+                    self.player.invincible = 80
+                    self.player.combo = 0
+                    self.shake = 12
+                    self.explosions.append(Explosion(self.player.rect.centerx, self.player.rect.centery))
+                    play(snd_hurt)
+                    if self.player.lives <= 0:
+                        self.state = "gameover"
+                        if self.score > self.highscores.get(self.difficulty, 0):
+                            self.highscores[self.difficulty] = self.score
+                            save_highscores(self.highscores)
                 break
+
+        # Diving enemies deal normal damage on contact (NOT instant kill)
+        if self.player.invincible <= 0:
+            for e in self.enemies:
+                if e.alive and e.diving and e.rect.colliderect(self.player.rect):
+                    e.alive = False
+                    self.explosions.append(Explosion(e.rect.centerx, e.rect.centery))
+                    if self.player.wingmen > 0:
+                        self.player.wingmen -= 1
+                        self.player.invincible = 70
+                        self.shake = 8
+                        self.float_texts.append(FloatingText(self.player.rect.centerx, self.player.rect.top - 15, "WINGMAN!", (200,200,255)))
+                        play(snd_power)
+                    else:
+                        dmg = 2 if self.double_damage else 1
+                        self.player.lives -= dmg
+                        self.player.invincible = 90
+                        self.player.combo = 0
+                        self.shake = 14
+                        play(snd_hurt)
+                        if self.player.lives <= 0:
+                            self.state = "gameover"
+                            if self.score > self.highscores.get(self.difficulty, 0):
+                                self.highscores[self.difficulty] = self.score
+                                save_highscores(self.highscores)
+                    break
 
         self.powerups = [p for p in self.powerups if p.update(ts)]
         for p in self.powerups[:]:
@@ -815,6 +1107,9 @@ class Game:
         self.debris = [d for d in self.debris if d.update(ts)]
         if len(self.debris) < 2 and random.random() < 0.004:
             self.debris.append(Debris())
+        self.emp_clouds = [c for c in self.emp_clouds if c.update(ts)]
+        if len(self.emp_clouds) < 2 and random.random() < 0.003:
+            self.emp_clouds.append(EMPCloud())
 
         self.update_enemies(ts)
         if all(not e.alive for e in self.enemies):
@@ -857,9 +1152,9 @@ class Game:
             screen.blit(tt, (SCREEN_WIDTH//2 - tt.get_width()//2, y)); y += 22
         # Controls reminder
         ctrl = [
-            "Shoot: Space/W   Ability: Shift/Q",
-            "Parry: E/F   EMP Vent: V   Bullet-Time: R",
-            "Warp: fly off left/right edge"
+            "Dash C  Parry E  EMP V  Time R  Overdrive Z  Tractor X  Decoy G",
+            "Escalate wave early: N   Music: M  Vol: ,/.  Next: /",
+            "Warp: fly off edges   |   Drop MP3s into music/ folder"
         ]
         for i, line in enumerate(ctrl):
             tt = font_tiny.render(line, True, GRAY)
@@ -911,6 +1206,7 @@ class Game:
             b = 70 + (i * 41) % 160
             pygame.draw.circle(screen, (b, b, b), (x + ox, y + oy), 1)
         for d in self.debris: d.draw(screen)
+        for c in self.emp_clouds: c.draw(screen)
         for e in self.enemies:
             if e.alive: screen.blit(e.image, (e.rect.x + ox, e.rect.y + oy))
         self.player.draw(screen)
@@ -925,7 +1221,18 @@ class Game:
         screen.blit(font_small.render(f"LVL {self.level}", True, CYAN), (12, 28))
         fname = getattr(self, "formation_name", "")
         if fname: screen.blit(font_tiny.render(fname, True, GRAY), (12, 48))
-        screen.blit(font_small.render(f"LIVES: {self.player.lives}", True, RED), (SCREEN_WIDTH-125, 6))
+        if self.escalation > 0:
+            screen.blit(font_tiny.render(f"ESCALATION x{self.escalation}", True, ORANGE), (12, 64))
+        # Music hint
+        if music_player.tracks:
+            mstatus = "ON" if music_player.enabled else "OFF"
+            screen.blit(font_tiny.render(f"Music {mstatus} [M]", True, GRAY), (SCREEN_WIDTH - 110, SCREEN_HEIGHT - 22))
+        else:
+            screen.blit(font_tiny.render("Drop MP3s in /music", True, GRAY), (SCREEN_WIDTH - 150, SCREEN_HEIGHT - 22))
+        lives_str = f"LIVES: {self.player.lives}"
+        if self.player.wingmen > 0:
+            lives_str += f"  W:{self.player.wingmen}"
+        screen.blit(font_small.render(lives_str, True, RED), (SCREEN_WIDTH-150, 6))
         screen.blit(font_tiny.render(char_names[self.player.char_index], True, char_colors[self.player.char_index]), (SCREEN_WIDTH-125, 28))
 
         if self.player.combo >= 3:
@@ -948,6 +1255,15 @@ class Game:
         pygame.draw.rect(screen, heat_col, (SCREEN_WIDTH//2 - hw//2, 48, int(hw * self.player.heat/100), 7))
         if self.player.overheating:
             screen.blit(font_tiny.render("OVERHEAT - V to VENT", True, RED), (SCREEN_WIDTH//2 - 60, 58))
+        # Overdrive meter
+        ow = 100
+        pygame.draw.rect(screen, DARK, (SCREEN_WIDTH//2 - ow//2, 58, ow, 6))
+        od_col = GOLD if self.player.overdrive_meter >= 80 else (180, 140, 40)
+        pygame.draw.rect(screen, od_col, (SCREEN_WIDTH//2 - ow//2, 58, int(ow * self.player.overdrive_meter/100), 6))
+        if self.player.overdrive_active > 0:
+            screen.blit(font_tiny.render("OVERDRIVE ACTIVE", True, GOLD), (SCREEN_WIDTH//2 - 55, 66))
+        elif self.player.overdrive_meter >= 80:
+            screen.blit(font_tiny.render("Z/TAB OVERDRIVE", True, GOLD), (SCREEN_WIDTH//2 - 55, 66))
 
         # Bullet time bar
         bw = 80
@@ -989,8 +1305,8 @@ class Game:
         t = font_large.render("PAUSED", True, WHITE)
         screen.blit(t, (SCREEN_WIDTH//2 - t.get_width()//2, 200))
         lines = ["P / ESC = Resume", "Q = Quit to Menu", "",
-                 "E/F = Parry   V = EMP Vent   R = Bullet-Time",
-                 "Fly off edge = Warp"]
+                 "C = Dash  Z = Overdrive  X = Tractor  G = Decoy",
+                 "E/F = Parry  V = EMP  R = Bullet-Time  Warp = edge"]
         for i, line in enumerate(lines):
             tt = font_small.render(line, True, GRAY if i > 1 else WHITE)
             screen.blit(tt, (SCREEN_WIDTH//2 - tt.get_width()//2, 270 + i*26))
@@ -1086,6 +1402,15 @@ def main():
                         game.mutator_index = (game.mutator_index - 1) % 3; play(snd_select)
                     if event.key in (pygame.K_DOWN, pygame.K_s):
                         game.mutator_index = (game.mutator_index + 1) % 3; play(snd_select)
+                # Music controls (work anywhere)
+                if event.key == pygame.K_m:
+                    music_player.toggle()
+                if event.key == pygame.K_COMMA or event.key == pygame.K_LEFTBRACKET:
+                    music_player.set_volume(music_player.volume - 0.1)
+                if event.key == pygame.K_PERIOD or event.key == pygame.K_RIGHTBRACKET:
+                    music_player.set_volume(music_player.volume + 0.1)
+                if event.key == pygame.K_SLASH:
+                    music_player.next_track()
         if game.state == "playing":
             game.update(keys)
         game.draw()
